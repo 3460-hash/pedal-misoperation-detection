@@ -1,0 +1,298 @@
+import cv2
+import mediapipe as mp
+import csv
+import time
+import math
+from collections import deque
+from pathlib import Path
+
+# =========================
+# 설정
+# =========================
+CAMERA_INDEX = 0
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+MIN_DETECTION_CONFIDENCE = 0.7
+MIN_TRACKING_CONFIDENCE = 0.7
+MIN_VISIBILITY = 0.5
+
+SMOOTH_WINDOW = 5          # 좌표 스무딩 프레임 수
+SHOW_PREVIEW = True
+SAVE_CSV = True
+CSV_FILENAME = "right_foot_data.csv"
+
+# 라벨 설정
+# 정상 촬영할 때 "normal"
+# 오조작 촬영할 때 "misoperation"
+LABEL = "normal"
+
+# 녹화/저장 시작 여부
+START_SAVING = False
+
+# =========================
+# MediaPipe 초기화
+# =========================
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    smooth_landmarks=True,
+    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+    min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+)
+
+# 오른발 기준 포인트
+RIGHT_POINTS = {
+    "knee": mp_pose.PoseLandmark.RIGHT_KNEE,
+    "ankle": mp_pose.PoseLandmark.RIGHT_ANKLE,
+    "heel": mp_pose.PoseLandmark.RIGHT_HEEL,
+    "toe": mp_pose.PoseLandmark.RIGHT_FOOT_INDEX,
+}
+
+# =========================
+# 스무딩 버퍼
+# =========================
+history = {
+    "knee": deque(maxlen=SMOOTH_WINDOW),
+    "ankle": deque(maxlen=SMOOTH_WINDOW),
+    "heel": deque(maxlen=SMOOTH_WINDOW),
+    "toe": deque(maxlen=SMOOTH_WINDOW),
+}
+
+# 이전 프레임 저장 (속도 계산용)
+prev_points = {
+    "knee": None,
+    "ankle": None,
+    "heel": None,
+    "toe": None,
+}
+prev_time = None
+
+# =========================
+# 유틸 함수
+# =========================
+def smooth_point(name: str, x: float, y: float):
+    """이동평균 스무딩"""
+    history[name].append((x, y))
+    xs = [p[0] for p in history[name]]
+    ys = [p[1] for p in history[name]]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+def distance(p1, p2):
+    if p1 is None or p2 is None:
+        return None
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def velocity(curr, prev, dt):
+    if curr is None or prev is None or dt is None or dt <= 0:
+        return None
+    return distance(curr, prev) / dt
+
+def draw_point(frame, point, name, color=(0, 0, 255)):
+    x, y = int(point[0]), int(point[1])
+    cv2.circle(frame, (x, y), 6, color, -1)
+    cv2.putText(
+        frame, name, (x + 6, y - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA
+    )
+
+def draw_line(frame, p1, p2, color=(255, 255, 255)):
+    x1, y1 = int(p1[0]), int(p1[1])
+    x2, y2 = int(p2[0]), int(p2[1])
+    cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+def ensure_csv_header(csv_path: Path):
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "label",
+                "saving",
+                "knee_x", "knee_y",
+                "ankle_x", "ankle_y",
+                "heel_x", "heel_y",
+                "toe_x", "toe_y",
+                "ankle_to_heel_dist",
+                "ankle_to_toe_dist",
+                "heel_to_toe_dist",
+                "knee_speed",
+                "ankle_speed",
+                "heel_speed",
+                "toe_speed",
+                "weight"   
+            ])
+
+def get_weight_value():
+    """
+    나중에 아두이노/센서 연결 시 여기서 실제 센서값 읽으면 됨.
+    지금은 테스트용으로 0.0 반환.
+    """
+    return 0.0
+
+# =========================
+# CSV 준비
+# =========================
+csv_path = Path(CSV_FILENAME)
+if SAVE_CSV:
+    ensure_csv_header(csv_path)
+
+# =========================
+# 카메라 열기
+# =========================
+cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+if not cap.isOpened():
+    raise RuntimeError("웹캠을 열 수 없습니다. CAMERA_INDEX를 확인하세요.")
+
+print("실행 시작")
+print("조작법:")
+print("  s : 저장 시작/중지 토글")
+print("  n : label = normal")
+print("  m : label = misoperation")
+print("  q 또는 ESC : 종료")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("프레임을 읽지 못했습니다.")
+        break
+
+    frame = cv2.flip(frame, 1)  
+    h, w, _ = frame.shape
+
+    now = time.time()
+    dt = None if prev_time is None else now - prev_time
+    prev_time = now
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(rgb)
+
+    processed_points = {
+        "knee": None,
+        "ankle": None,
+        "heel": None,
+        "toe": None,
+    }
+
+    if results.pose_landmarks:
+        landmarks = results.pose_landmarks.landmark
+
+        # 오른발 필요한 점만 추출
+        for name, idx in RIGHT_POINTS.items():
+            lm = landmarks[idx]
+            if lm.visibility >= MIN_VISIBILITY:
+                x = lm.x * w
+                y = lm.y * h
+                sx, sy = smooth_point(name, x, y)
+                processed_points[name] = (sx, sy)
+
+        # 점과 선 그리기
+        if processed_points["knee"] is not None:
+            draw_point(frame, processed_points["knee"], "knee", (255, 0, 0))
+        if processed_points["ankle"] is not None:
+            draw_point(frame, processed_points["ankle"], "ankle", (0, 255, 0))
+        if processed_points["heel"] is not None:
+            draw_point(frame, processed_points["heel"], "heel", (0, 0, 255))
+        if processed_points["toe"] is not None:
+            draw_point(frame, processed_points["toe"], "toe", (0, 255, 255))
+
+        if processed_points["knee"] is not None and processed_points["ankle"] is not None:
+            draw_line(frame, processed_points["knee"], processed_points["ankle"], (200, 200, 200))
+        if processed_points["ankle"] is not None and processed_points["heel"] is not None:
+            draw_line(frame, processed_points["ankle"], processed_points["heel"], (255, 255, 255))
+        if processed_points["ankle"] is not None and processed_points["toe"] is not None:
+            draw_line(frame, processed_points["ankle"], processed_points["toe"], (255, 255, 255))
+
+    # 파생 feature 계산
+    ankle_to_heel = distance(processed_points["ankle"], processed_points["heel"])
+    ankle_to_toe = distance(processed_points["ankle"], processed_points["toe"])
+    heel_to_toe = distance(processed_points["heel"], processed_points["toe"])
+
+    knee_speed = velocity(processed_points["knee"], prev_points["knee"], dt)
+    ankle_speed = velocity(processed_points["ankle"], prev_points["ankle"], dt)
+    heel_speed = velocity(processed_points["heel"], prev_points["heel"], dt)
+    toe_speed = velocity(processed_points["toe"], prev_points["toe"], dt)
+
+    # 이전점 업데이트
+    for name in prev_points:
+        prev_points[name] = processed_points[name]
+
+    # 센서값 자리
+    weight_value = get_weight_value()
+
+    # 화면 텍스트
+    status_text = f"label={LABEL} | saving={START_SAVING}"
+    cv2.putText(
+        frame, status_text, (20, 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA
+    )
+
+    if ankle_speed is not None:
+        cv2.putText(
+            frame, f"ankle_speed={ankle_speed:.2f}", (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
+        )
+    if heel_speed is not None:
+        cv2.putText(
+            frame, f"heel_speed={heel_speed:.2f}", (20, 95),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
+        )
+    if toe_speed is not None:
+        cv2.putText(
+            frame, f"toe_speed={toe_speed:.2f}", (20, 125),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
+        )
+
+    # CSV 저장
+    if SAVE_CSV and START_SAVING:
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now,
+                LABEL,
+                int(START_SAVING),
+                processed_points["knee"][0] if processed_points["knee"] else "",
+                processed_points["knee"][1] if processed_points["knee"] else "",
+                processed_points["ankle"][0] if processed_points["ankle"] else "",
+                processed_points["ankle"][1] if processed_points["ankle"] else "",
+                processed_points["heel"][0] if processed_points["heel"] else "",
+                processed_points["heel"][1] if processed_points["heel"] else "",
+                processed_points["toe"][0] if processed_points["toe"] else "",
+                processed_points["toe"][1] if processed_points["toe"] else "",
+                ankle_to_heel if ankle_to_heel is not None else "",
+                ankle_to_toe if ankle_to_toe is not None else "",
+                heel_to_toe if heel_to_toe is not None else "",
+                knee_speed if knee_speed is not None else "",
+                ankle_speed if ankle_speed is not None else "",
+                heel_speed if heel_speed is not None else "",
+                toe_speed if toe_speed is not None else "",
+                weight_value
+            ])
+
+    if SHOW_PREVIEW:
+        cv2.imshow("Right Foot Tracking", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("s"):
+        START_SAVING = not START_SAVING
+        print(f"저장 상태: {START_SAVING}")
+
+    elif key == ord("n"):
+        LABEL = "normal"
+        print("label = normal")
+
+    elif key == ord("m"):
+        LABEL = "misoperation"
+        print("label = misoperation")
+
+    elif key == ord("q") or key == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
