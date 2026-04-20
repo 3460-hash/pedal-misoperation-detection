@@ -1,0 +1,432 @@
+import cv2
+import time
+import serial
+import joblib
+import numpy as np
+import mediapipe as mp
+from collections import deque
+from tensorflow.keras.models import load_model
+
+# =========================
+# 사용자 설정
+# =========================
+MODEL_PATH = "pedal_lstm_model.keras"
+SCALER_PATH = "pedal_scaler.pkl"
+
+CAMERA_INDEX = 0
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
+
+USE_SERIAL = True
+SERIAL_PORT = "COM4"      # 네 환경에 맞게 수정
+BAUD_RATE = 115200
+
+# 학습 때와 동일하게 20fps 기준으로 샘플링
+TARGET_FPS = 20.0
+SAMPLE_INTERVAL = 1.0 / TARGET_FPS
+SEQUENCE_LENGTH = 20
+THRESHOLD = 0.5
+
+# MediaPipe 설정
+MIN_DETECTION_CONFIDENCE = 0.7
+MIN_TRACKING_CONFIDENCE = 0.7
+MIN_VISIBILITY = 0.5
+
+# 속도 스무딩
+SMOOTH_WINDOW = 5
+
+# 예측 확률 스무딩
+PRED_SMOOTH_WINDOW = 5
+
+# 프레임 끊김 기준
+MAX_VALID_DT = 0.20
+
+# =========================
+# 로드셀 baseline 관련 설정
+# =========================
+BASELINE_SAMPLES = 60          # 시작 시 baseline 계산에 사용할 샘플 수
+CONTACT_THRESHOLD = 8000.0     # baseline 대비 변화량 기준(예시값, 데이터 보고 조절)
+LOADCELL_SMOOTH_WINDOW = 5     # raw 센서값 평균화
+
+# =========================
+# 모델 및 스케일러 로드
+# =========================
+model = load_model(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
+
+# =========================
+# MediaPipe 초기화
+# =========================
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    smooth_landmarks=True,
+    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+    min_tracking_confidence=MIN_TRACKING_CONFIDENCE
+)
+
+# =========================
+# 시리얼 초기화
+# =========================
+ser = None
+if USE_SERIAL:
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+        time.sleep(2)
+        print(f"[INFO] Serial connected: {SERIAL_PORT}")
+    except Exception as e:
+        print(f"[WARN] Serial connection failed: {e}")
+        USE_SERIAL = False
+
+if not USE_SERIAL:
+    raise RuntimeError("이 코드는 raw 로드셀 값을 받아 baseline으로 heel_contact를 판단하는 구조이므로 시리얼 연결이 필요합니다.")
+
+# =========================
+# 버퍼들
+# =========================
+sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
+prediction_buffer = deque(maxlen=PRED_SMOOTH_WINDOW)
+
+ankle_speed_buffer = deque(maxlen=SMOOTH_WINDOW)
+toe_speed_buffer = deque(maxlen=SMOOTH_WINDOW)
+loadcell_buffer = deque(maxlen=LOADCELL_SMOOTH_WINDOW)
+
+last_sample_time = None
+last_ankle_pos = None
+last_toe_pos = None
+last_valid_used_timestamp = None
+
+baseline_value = None
+baseline_samples_buffer = []
+
+
+# =========================
+# 유틸 함수
+# =========================
+def read_raw_loadcell():
+    """
+    아두이노에서 로드셀 원시값만 한 줄씩 보낸다고 가정
+    예:
+    123456
+    123210
+    124002
+    """
+    if ser is None:
+        return None
+
+    try:
+        if ser.in_waiting:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line == "":
+                return None
+            return float(line)
+    except:
+        return None
+
+    return None
+
+
+def smooth_value(buffer, value):
+    buffer.append(value)
+    return float(np.mean(buffer))
+
+
+def update_baseline(raw_value):
+    """
+    시작 초기 baseline 계산
+    """
+    global baseline_value
+
+    if baseline_value is not None:
+        return baseline_value, True
+
+    baseline_samples_buffer.append(raw_value)
+
+    if len(baseline_samples_buffer) >= BASELINE_SAMPLES:
+        baseline_value = float(np.mean(baseline_samples_buffer))
+        return baseline_value, True
+
+    return None, False
+
+
+def get_heel_contact_from_raw(raw_value):
+    """
+    baseline 대비 변화량으로 뒤꿈치 접촉 여부를 판단
+    """
+    global baseline_value
+
+    smoothed_raw = smooth_value(loadcell_buffer, raw_value)
+
+    base, ready = update_baseline(smoothed_raw)
+    if not ready:
+        return None, smoothed_raw, None
+
+    delta = smoothed_raw - baseline_value
+
+    # 변화량 절댓값이 기준 이상이면 접촉으로 판단
+    heel_contact = 1 if abs(delta) >= CONTACT_THRESHOLD else 0
+    return heel_contact, smoothed_raw, delta
+
+
+def get_landmark_xy(landmarks, idx, width, height):
+    lm = landmarks[idx]
+    return np.array([lm.x * width, lm.y * height], dtype=np.float32), lm.visibility
+
+
+def safe_speed(curr_pos, prev_pos, dt):
+    if curr_pos is None or prev_pos is None or dt <= 0:
+        return None
+    dist = np.linalg.norm(curr_pos - prev_pos)
+    return dist / dt
+
+
+def build_feature_vector(ankle_speed, toe_speed, heel_contact, dt):
+    return np.array([ankle_speed, toe_speed, heel_contact, dt], dtype=np.float32)
+
+
+def predict_sequence():
+    if len(sequence_buffer) < SEQUENCE_LENGTH:
+        return None
+
+    seq = np.array(sequence_buffer, dtype=np.float32)
+    seq_scaled = scaler.transform(seq)
+    seq_scaled = np.expand_dims(seq_scaled, axis=0)
+
+    prob = float(model.predict(seq_scaled, verbose=0)[0][0])
+    prediction_buffer.append(prob)
+    prob_smooth = float(np.mean(prediction_buffer))
+
+    pred = 1 if prob_smooth >= THRESHOLD else 0
+    return pred, prob_smooth
+
+
+def draw_text_block(frame, lines, start_x=20, start_y=30, line_gap=28):
+    y = start_y
+    for text in lines:
+        cv2.putText(
+            frame,
+            text,
+            (start_x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2
+        )
+        y += line_gap
+
+
+def reset_tracking_state():
+    global last_sample_time, last_ankle_pos, last_toe_pos, last_valid_used_timestamp
+    sequence_buffer.clear()
+    prediction_buffer.clear()
+    ankle_speed_buffer.clear()
+    toe_speed_buffer.clear()
+
+    last_sample_time = None
+    last_ankle_pos = None
+    last_toe_pos = None
+    last_valid_used_timestamp = None
+
+
+# =========================
+# 카메라 열기
+# =========================
+cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+
+if not cap.isOpened():
+    raise RuntimeError("카메라를 열 수 없습니다.")
+
+print("[INFO] Press ESC to quit")
+print("[INFO] Press R to reset sequence buffer")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("[WARN] frame read failed")
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+    current_time = time.time()
+
+    status_lines = []
+
+    # -------------------------
+    # 1) 로드셀 raw 읽기 -> baseline 기반 접촉 판단
+    # -------------------------
+    raw_load_value = read_raw_loadcell()
+
+    heel_contact = None
+    smoothed_load_value = None
+    load_delta = None
+
+    if raw_load_value is not None:
+        heel_contact, smoothed_load_value, load_delta = get_heel_contact_from_raw(raw_load_value)
+
+    if baseline_value is None:
+        status_lines.append(f"baseline collecting: {len(baseline_samples_buffer)}/{BASELINE_SAMPLES}")
+    else:
+        status_lines.append(f"baseline: {baseline_value:.1f}")
+
+    if smoothed_load_value is not None:
+        status_lines.append(f"loadcell(raw smoothed): {smoothed_load_value:.1f}")
+    if load_delta is not None:
+        status_lines.append(f"load delta: {load_delta:.1f}")
+    if heel_contact is not None:
+        status_lines.append(f"heel_contact: {heel_contact}")
+    else:
+        status_lines.append("heel_contact: waiting")
+
+    # -------------------------
+    # 2) 영상에서 오른발 랜드마크 추출
+    # -------------------------
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(rgb)
+
+    valid_feature_ready = False
+    ankle_speed_smoothed = None
+    toe_speed_smoothed = None
+    pred_result = None
+
+    if results.pose_landmarks:
+        landmarks = results.pose_landmarks.landmark
+
+        try:
+            knee_pos, knee_vis = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_KNEE, w, h)
+            ankle_pos, ankle_vis = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_ANKLE, w, h)
+            heel_pos, heel_vis = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_HEEL, w, h)
+            toe_pos, toe_vis = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_FOOT_INDEX, w, h)
+
+            mp_drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS
+            )
+
+            for pt in [knee_pos, ankle_pos, heel_pos, toe_pos]:
+                x, y = int(pt[0]), int(pt[1])
+                cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
+
+            visible_ok = (
+                knee_vis >= MIN_VISIBILITY and
+                ankle_vis >= MIN_VISIBILITY and
+                heel_vis >= MIN_VISIBILITY and
+                toe_vis >= MIN_VISIBILITY
+            )
+
+            if visible_ok:
+                if last_sample_time is None:
+                    last_sample_time = current_time
+                    last_ankle_pos = ankle_pos.copy()
+                    last_toe_pos = toe_pos.copy()
+                else:
+                    elapsed = current_time - last_sample_time
+
+                    # 학습 때와 맞추기 위해 약 20fps로만 샘플 사용
+                    if elapsed >= SAMPLE_INTERVAL:
+                        ankle_speed_raw = safe_speed(ankle_pos, last_ankle_pos, elapsed)
+                        toe_speed_raw = safe_speed(toe_pos, last_toe_pos, elapsed)
+
+                        last_sample_time = current_time
+                        last_ankle_pos = ankle_pos.copy()
+                        last_toe_pos = toe_pos.copy()
+
+                        if ankle_speed_raw is not None and toe_speed_raw is not None and heel_contact is not None:
+                            ankle_speed_smoothed = smooth_value(ankle_speed_buffer, ankle_speed_raw)
+                            toe_speed_smoothed = smooth_value(toe_speed_buffer, toe_speed_raw)
+
+                            used_timestamp = current_time
+                            if last_valid_used_timestamp is None:
+                                dt = 0.0
+                            else:
+                                dt = used_timestamp - last_valid_used_timestamp
+
+                            last_valid_used_timestamp = used_timestamp
+
+                            # 프레임 끊김이 크면 버퍼 리셋
+                            if dt > MAX_VALID_DT:
+                                status_lines.append("tracking gap detected -> buffer reset")
+                                reset_tracking_state()
+                                last_sample_time = current_time
+                                last_ankle_pos = ankle_pos.copy()
+                                last_toe_pos = toe_pos.copy()
+                            else:
+                                feature_vec = build_feature_vector(
+                                    ankle_speed=ankle_speed_smoothed,
+                                    toe_speed=toe_speed_smoothed,
+                                    heel_contact=heel_contact,
+                                    dt=dt
+                                )
+                                sequence_buffer.append(feature_vec)
+                                valid_feature_ready = True
+            else:
+                status_lines.append("right foot visibility low")
+
+        except Exception as e:
+            status_lines.append(f"landmark error: {str(e)}")
+    else:
+        status_lines.append("pose not detected")
+
+    status_lines.append(f"sequence: {len(sequence_buffer)}/{SEQUENCE_LENGTH}")
+
+    # -------------------------
+    # 3) 최근 20프레임이 쌓이면 계속 예측
+    # -------------------------
+    if valid_feature_ready and len(sequence_buffer) == SEQUENCE_LENGTH:
+        pred_result = predict_sequence()
+
+    if ankle_speed_smoothed is not None:
+        status_lines.append(f"ankle_speed: {ankle_speed_smoothed:.2f}")
+    if toe_speed_smoothed is not None:
+        status_lines.append(f"toe_speed: {toe_speed_smoothed:.2f}")
+
+    if pred_result is not None:
+        pred, prob = pred_result
+        if pred == 1:
+            status_lines.append(f"prediction: MISOPERATION ({prob:.3f})")
+            cv2.putText(
+                frame,
+                "WARNING: PEDAL MISOPERATION",
+                (20, h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                3
+            )
+        else:
+            status_lines.append(f"prediction: NORMAL ({prob:.3f})")
+            cv2.putText(
+                frame,
+                "NORMAL",
+                (20, h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                3
+            )
+    else:
+        status_lines.append("prediction: waiting for sequence")
+
+    draw_text_block(frame, status_lines)
+
+    cv2.imshow("Real-time Pedal Misoperation Detection", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:   # ESC
+        break
+    elif key == ord('r') or key == ord('R'):
+        reset_tracking_state()
+        print("[INFO] sequence buffer reset")
+
+cap.release()
+cv2.destroyAllWindows()
+
+if ser is not None:
+    ser.close()
+
+pose.close()
