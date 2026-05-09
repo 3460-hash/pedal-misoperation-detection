@@ -1,0 +1,26 @@
+#include "HX711.h"
+
+#define DOUT 3
+#define SCK 2
+
+HX711 scale;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  scale.begin(DOUT, SCK);
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711_NOT_READY");
+  } else {
+    Serial.println("HX711_READY");
+  }
+}
+
+void loop() {
+  if (scale.is_ready()) {
+    long raw = scale.read(); 
+    Serial.println(raw);
+  }
+}
