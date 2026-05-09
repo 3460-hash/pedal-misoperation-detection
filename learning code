@@ -1,288 +1,255 @@
-import joblib
+from google.colab import files
+uploaded = files.upload()
+
+import os
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+import joblib
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
-import tensorflow as tf
+from sklearn.utils.class_weight import compute_class_weight
+
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
-# =========================
-# 설정
-# =========================
-CSV_PATH = "pedal_data.csv"
-MODEL_PATH = "pedal_lstm_model.keras"
-SCALER_PATH = "pedal_scaler.pkl"
 
-TIMESTAMP_COL = "timestamp"
-LABEL_COL = "label"
-FEATURE_COLS = ["ankle_speed", "toe_speed", "heel_contact"]
-SESSION_COL = "session_id"  
 
-ORIGINAL_FPS = 60
-TARGET_FPS = 20
-DOWNSAMPLE_STEP = ORIGINAL_FPS // TARGET_FPS   # 3
+CSV_FILE = "pedal_training_data_cleaneded.csv"
 
-SEQUENCE_LENGTH = 20
-TEST_SIZE = 0.2
+FEATURE_COLUMNS = [
+    "ankle_speed",
+    "toe_speed",
+    "heel_contact"
+]
+
+LABEL_COLUMN = "label"
+
+# 30fps 기준 1초
+WINDOW_SIZE = 30
+
+# 학습 데이터 증가용
+# 1이면 1프레임씩 밀면서 window 생성
+# 30이면 완전히 1초 단위로만 자름
+# 실시간 판단은 1초마다 하더라도, 학습은 STEP_SIZE=1이 보통 더 좋음
+STEP_SIZE = 1
+
+MODEL_SAVE_PATH = "pedal_lstm_model.keras"
+SCALER_SAVE_PATH = "pedal_scaler.pkl"
+
 RANDOM_STATE = 42
-EPOCHS = 50
-BATCH_SIZE = 32
-
-# =========================
-# 이상치/결측 처리 기준
-# =========================
-MAX_DT_SEC = 0.20
-MIN_SPEED = 0.0
-MAX_SPEED = 10000.0   
-
-
-def load_csv(csv_path):
-    df = pd.read_csv(csv_path)
-
-    required = [TIMESTAMP_COL, LABEL_COL] + FEATURE_COLS
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"CSV에 '{col}' 컬럼이 없습니다.")
-
-    # 숫자형 변환
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # inf -> NaN
-    df = df.replace([np.inf, -np.inf], np.nan)
-
-    # 필수값 결측 제거
-    before = len(df)
-    df = df.dropna(subset=required).copy()
-    print(f"[전처리] 결측/비정상 필수값 제거: {before - len(df)}개")
-
-    # heel_contact 정리
-    # 0/1이 아니면 NaN 처리 후 제거
-    df["heel_contact"] = df["heel_contact"].round()
-    df.loc[~df["heel_contact"].isin([0, 1]), "heel_contact"] = np.nan
-    before = len(df)
-    df = df.dropna(subset=["heel_contact"]).copy()
-    df["heel_contact"] = df["heel_contact"].astype(int)
-    print(f"[전처리] heel_contact 이상값 제거: {before - len(df)}개")
-
-    # 라벨 0/1만 허용
-    df[LABEL_COL] = df[LABEL_COL].round()
-    df.loc[~df[LABEL_COL].isin([0, 1]), LABEL_COL] = np.nan
-    before = len(df)
-    df = df.dropna(subset=[LABEL_COL]).copy()
-    df[LABEL_COL] = df[LABEL_COL].astype(int)
-    print(f"[전처리] label 이상값 제거: {before - len(df)}개")
-
-    # 정렬
-    if SESSION_COL in df.columns:
-        df = df.sort_values([SESSION_COL, TIMESTAMP_COL]).reset_index(drop=True)
-    else:
-        df = df.sort_values(TIMESTAMP_COL).reset_index(drop=True)
-
-    return df
 
 
-def downsample_group(group, step=3):
-    group = group.reset_index(drop=True)
-    return group.iloc[::step].copy().reset_index(drop=True)
 
+if not os.path.exists(CSV_FILE):
+    csv_files = [name for name in uploaded.keys() if name.endswith(".csv")]
 
-def downsample_df(df, step=3):
-    if SESSION_COL in df.columns:
-        parts = []
-        for _, group in df.groupby(SESSION_COL):
-            parts.append(downsample_group(group, step=step))
-        df_ds = pd.concat(parts, ignore_index=True)
-    else:
-        df_ds = downsample_group(df, step=step)
-    return df_ds
+    if len(csv_files) == 0:
+        raise FileNotFoundError("업로드된 CSV 파일이 없습니다.")
 
+    CSV_FILE = csv_files[0]
+    print("CSV_FILE 자동 설정:", CSV_FILE)
 
-def clean_after_downsample(df):
-    df = df.copy()
 
-    # dt 계산
-    if SESSION_COL in df.columns:
-        df["dt"] = df.groupby(SESSION_COL)[TIMESTAMP_COL].diff()
-    else:
-        df["dt"] = df[TIMESTAMP_COL].diff()
+df = pd.read_csv(CSV_FILE)
 
-    # 첫 프레임은 dt=0
-    df["dt"] = df["dt"].fillna(0.0)
+print("원본 데이터 크기:", df.shape)
+print(df.head())
+print()
 
-    # ms 단위 대응
-    positive_dt = df.loc[df["dt"] > 0, "dt"]
-    if len(positive_dt) > 0 and positive_dt.median() > 1.0:
-        df["dt"] = df["dt"] / 1000.0
-
-    # timestamp 역전/중복 제거
-    before = len(df)
-    df = df[(df["dt"] >= 0.0)].copy()
-    print(f"[전처리] timestamp 역전 제거: {before - len(df)}개")
+required_columns = FEATURE_COLUMNS + [LABEL_COLUMN]
 
-    # 속도 이상치 제거
-    before = len(df)
-    for col in ["ankle_speed", "toe_speed"]:
-        df.loc[(df[col] < MIN_SPEED) | (df[col] > MAX_SPEED), col] = np.nan
-    df = df.dropna(subset=["ankle_speed", "toe_speed"]).copy()
-    print(f"[전처리] 속도 이상치 제거: {before - len(df)}개")
+for col in required_columns:
+    if col not in df.columns:
+        raise ValueError(f"필수 컬럼이 없습니다: {col}")
 
-    # 너무 긴 공백은 '끊긴 프레임'으로 간주
-    df["valid_frame"] = 1
-    df.loc[df["dt"] > MAX_DT_SEC, "valid_frame"] = 0
+df = df[required_columns].copy()
+df = df.dropna().reset_index(drop=True)
 
-    return df.reset_index(drop=True)
+df[LABEL_COLUMN] = df[LABEL_COLUMN].astype(int)
+df["heel_contact"] = df["heel_contact"].astype(int)
 
+# 혹시 모를 이상한 label 제거
+df = df[df[LABEL_COLUMN].isin([0, 1])].copy()
+df = df[df["heel_contact"].isin([0, 1])].copy()
+df = df.reset_index(drop=True)
 
-def build_sequences(df, seq_len):
-    feature_cols = FEATURE_COLS + ["dt"]
+print("정리 후 데이터 크기:", df.shape)
+print("라벨 분포:")
+print(df[LABEL_COLUMN].value_counts())
+print()
 
-    X, y = [], []
 
-    if SESSION_COL in df.columns:
-        groups = df.groupby(SESSION_COL)
-    else:
-        groups = [("all", df)]
+scaler = StandardScaler()
+df[FEATURE_COLUMNS] = scaler.fit_transform(df[FEATURE_COLUMNS])
 
-    skipped_gap = 0
+print("스케일링 완료")
+print(df.head())
+print()
 
-    for _, group in groups:
-        group = group.reset_index(drop=True)
 
-        if len(group) < seq_len:
-            continue
+def make_sequences(dataframe, feature_cols, label_col, window_size, step_size):
+    X = []
+    y = []
 
-        features = group[feature_cols].values.astype(np.float32)
-        labels = group[LABEL_COL].values.astype(np.int32)
-        valid_flags = group["valid_frame"].values.astype(np.int32)
+    features = dataframe[feature_cols].values
+    labels = dataframe[label_col].values
 
-        for i in range(len(group) - seq_len + 1):
-            seq_x = features[i:i + seq_len]
-            seq_y = labels[i + seq_len - 1]
-            seq_valid = valid_flags[i:i + seq_len]
+    for start in range(0, len(dataframe) - window_size + 1, step_size):
+        end = start + window_size
 
-            # 시퀀스 안에 프레임 끊김 있으면 버림
-            if np.any(seq_valid == 0):
-                skipped_gap += 1
-                continue
+        window_features = features[start:end]
+        window_labels = labels[start:end]
 
-            # NaN 최종 안전검사
-            if np.isnan(seq_x).any():
-                continue
+        count_0 = np.sum(window_labels == 0)
+        count_1 = np.sum(window_labels == 1)
 
-            X.append(seq_x)
-            y.append(seq_y)
+        # 1초 구간에서 오작동 label이 더 많으면 오작동
+        # 같으면 정상으로 처리
+        if count_1 > count_0:
+            window_label = 1
+        else:
+            window_label = 0
 
-    print(f"[전처리] 프레임 끊김 때문에 버린 시퀀스 수: {skipped_gap}")
+        X.append(window_features)
+        y.append(window_label)
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.int32)
-    return X, y
+    return np.array(X), np.array(y)
 
 
-def scale_sequences(X_train, X_val):
-    n_train, seq_len, n_feat = X_train.shape
-    n_val = X_val.shape[0]
+X, y = make_sequences(
+    df,
+    FEATURE_COLUMNS,
+    LABEL_COLUMN,
+    WINDOW_SIZE,
+    STEP_SIZE
+)
 
-    scaler = StandardScaler()
+print("X shape:", X.shape)
+print("y shape:", y.shape)
+print("시퀀스 라벨 분포:")
+print(pd.Series(y).value_counts())
+print()
 
-    X_train_2d = X_train.reshape(-1, n_feat)
-    X_val_2d = X_val.reshape(-1, n_feat)
+if len(np.unique(y)) < 2:
+    raise ValueError("정상/오작동 두 라벨이 모두 있어야 학습할 수 있습니다.")
 
-    X_train_scaled = scaler.fit_transform(X_train_2d).reshape(n_train, seq_len, n_feat)
-    X_val_scaled = scaler.transform(X_val_2d).reshape(n_val, seq_len, n_feat)
 
-    return X_train_scaled, X_val_scaled, scaler
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
 
+print("X_train:", X_train.shape)
+print("X_test:", X_test.shape)
+print()
 
-def build_model(seq_len, n_features):
-    model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(seq_len, n_features)),
-        Dropout(0.2),
-        LSTM(32),
-        Dropout(0.2),
-        Dense(16, activation="relu"),
-        Dense(1, activation="sigmoid")
-    ])
 
-    model.compile(
-        optimizer="adam",
-        loss="binary_crossentropy",
-        metrics=[
-            "accuracy",
-            tf.keras.metrics.Precision(name="precision"),
-            tf.keras.metrics.Recall(name="recall")
-        ]
-    )
-    return model
+classes = np.array([0, 1])
 
+class_weights_array = compute_class_weight(
+    class_weight="balanced",
+    classes=classes,
+    y=y_train
+)
 
-def main():
-    print("CSV 불러오는 중...")
-    df = load_csv(CSV_PATH)
-    print(f"원본 데이터 수: {len(df)}")
+class_weight = {
+    0: class_weights_array[0],
+    1: class_weights_array[1]
+}
 
-    print(f"{ORIGINAL_FPS}fps -> {TARGET_FPS}fps 다운샘플링 중...")
-    df_ds = downsample_df(df, step=DOWNSAMPLE_STEP)
-    print(f"다운샘플 후 데이터 수: {len(df_ds)}")
+print("class_weight:", class_weight)
+print()
 
-    df_ds = clean_after_downsample(df_ds)
 
-    X, y = build_sequences(df_ds, SEQUENCE_LENGTH)
+model = Sequential([
+    Input(shape=(WINDOW_SIZE, len(FEATURE_COLUMNS))),
 
-    if len(X) == 0:
-        raise ValueError("유효한 시퀀스가 없습니다. 이상치 기준이 너무 빡세거나 데이터가 부족할 수 있습니다.")
+    LSTM(64, return_sequences=True),
+    Dropout(0.3),
 
-    print("시퀀스 개수:", len(X))
-    print("X shape:", X.shape)
-    print("y shape:", y.shape)
+    LSTM(32),
+    Dropout(0.3),
 
-    unique, counts = np.unique(y, return_counts=True)
-    print("라벨 분포:", dict(zip(unique, counts)))
+    Dense(32, activation="relu"),
+    Dropout(0.2),
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-        stratify=y
-    )
+    Dense(1, activation="sigmoid")
+])
 
-    X_train_scaled, X_val_scaled, scaler = scale_sequences(X_train, X_val)
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss="binary_crossentropy",
+    metrics=["accuracy"]
+)
 
-    model = build_model(SEQUENCE_LENGTH, X_train.shape[2])
-    model.summary()
+model.summary()
 
-    callbacks = [
-        EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
-        ModelCheckpoint(MODEL_PATH, monitor="val_loss", save_best_only=True)
-    ]
 
-    print("학습 시작...")
-    model.fit(
-        X_train_scaled, y_train,
-        validation_data=(X_val_scaled, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks,
-        verbose=1
-    )
 
-    print("검증 평가 중...")
-    y_prob = model.predict(X_val_scaled).ravel()
-    y_pred = (y_prob >= 0.5).astype(int)
+early_stopping = EarlyStopping(
+    monitor="val_loss",
+    patience=10,
+    restore_best_weights=True
+)
 
-    print("\n=== Validation Report ===")
-    print(classification_report(y_val, y_pred, digits=4))
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_val, y_pred))
+checkpoint = ModelCheckpoint(
+    MODEL_SAVE_PATH,
+    monitor="val_loss",
+    save_best_only=True
+)
 
-    joblib.dump(scaler, SCALER_PATH)
-    print(f"\n모델 저장 완료: {MODEL_PATH}")
-    print(f"스케일러 저장 완료: {SCALER_PATH}")
+history = model.fit(
+    X_train,
+    y_train,
+    validation_split=0.2,
+    epochs=100,
+    batch_size=32,
+    callbacks=[early_stopping, checkpoint],
+    class_weight=class_weight,
+    verbose=1
+)
 
 
-if __name__ == "__main__":
-    main()
+
+loss, acc = model.evaluate(X_test, y_test, verbose=0)
+
+print()
+print("===== Test Result =====")
+print("Test loss:", loss)
+print("Test accuracy:", acc)
+
+y_pred_prob = model.predict(X_test)
+y_pred = (y_pred_prob >= 0.5).astype(int).reshape(-1)
+
+print()
+print("===== Confusion Matrix =====")
+print(confusion_matrix(y_test, y_pred))
+
+print()
+print("===== Classification Report =====")
+print(classification_report(
+    y_test,
+    y_pred,
+    target_names=["normal", "misoperation"]
+))
+
+
+
+model.save(MODEL_SAVE_PATH)
+joblib.dump(scaler, SCALER_SAVE_PATH)
+
+print()
+print("저장 완료:")
+print(MODEL_SAVE_PATH)
+print(SCALER_SAVE_PATH)
+
+
+files.download(MODEL_SAVE_PATH)
+files.download(SCALER_SAVE_PATH)
